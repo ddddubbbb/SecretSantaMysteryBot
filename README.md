@@ -1,12 +1,5 @@
 # 🎄 Secret Santa: Mystery-Bot
 
-secretsanta-bot/
-├── main.py            # Основной бот
-├── config.py          # Настройки
-├── translations.py    # Переводы RU/EN
-├── premium_nicks.py   # Премиум-ники по темам
-├── requirements.txt
-└── railway.toml     
 
 ## Тайный Санта, но веселее
 
