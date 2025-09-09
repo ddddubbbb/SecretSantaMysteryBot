@@ -1,9 +1,7 @@
 services:
   - type: web
-    name: SecretSantaMysteryBot
+    name: secret-santa-bot
     runtime: python
-    env: production
-    region: oregon
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
