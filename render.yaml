@@ -5,7 +5,8 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    # Worker сервис не требует портов - только background процесс
+    # Worker service - background процесс без веб-интерфейса
+    # Не требует биндинга портов, поэтому не будет port scan timeout
     autoDeploy: false
     envVars:
       - key: BOT_TOKEN

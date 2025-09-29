@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, InlineKeyboardButton, InlineKeyboardMarkup, 
-    PreCheckoutQuery, LabeledPrice, ChatMemberOwner, ChatMemberAdministrator
+    PreCheckoutQuery, LabeledPrice, ChatMemberOwner, ChatMemberAdministrator, ErrorEvent
 )
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -836,17 +836,17 @@ async def donate(message: Message):
 
 # === ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ===
 @dp.error()
-async def error_handler(update, exception):
-    """Глобальный обработчик ошибок"""
-    logger.error(f"Ошибка обработки обновления {update}: {exception}")
+async def error_handler(event: ErrorEvent):
+    """Глобальный обработчик ошибок для aiogram 3.x"""
+    logger.error(f"Ошибка обработки обновления {event.update}: {event.exception}")
     logger.error(traceback.format_exc())
     
     # Попытка отправить уведомление пользователю
     try:
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply("❌ Произошла ошибка. Попробуйте позже.")
-        elif hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.reply("❌ Произошла ошибка. Попробуйте позже.")
+        if hasattr(event.update, 'message') and event.update.message:
+            await event.update.message.reply("❌ Произошла ошибка. Попробуйте позже.")
+        elif hasattr(event.update, 'callback_query') and event.update.callback_query:
+            await event.update.callback_query.message.reply("❌ Произошла ошибка. Попробуйте позже.")
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
 
