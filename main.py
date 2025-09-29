@@ -239,9 +239,13 @@ def get_lang(chat_id):
         return 'ru'
 
 def get_theme(chat_id):
-    with get_db() as db:
-        row = db.execute('SELECT theme FROM games WHERE chat_id = ?', (chat_id,)).fetchone()
-        return row['theme'] if row else 'christmas'
+    try:
+        with get_db() as db:
+            row = db.execute('SELECT theme FROM games WHERE chat_id = ?', (str(chat_id),)).fetchone()
+            return row['theme'] if row else 'christmas'
+    except Exception as e:
+        logger.error(f"Ошибка получения темы: {e}")
+        return 'christmas'
 
 def get_text(key, lang, **kwargs):
     return TEXTS[lang][key].format(**kwargs)
@@ -474,7 +478,7 @@ async def finish_game(chat_id):
     
     with get_db() as db:
         players = db.execute('''
-            SELECT p.nick, p.score, p.full_name FROM players p
+            SELECT p.user_id, p.nick, p.score, p.full_name FROM players p
             WHERE p.chat_id = ?
             ORDER BY p.score DESC
         ''', (chat_id,)).fetchall()
@@ -694,9 +698,15 @@ async def leaderboard(message: Message):
             LIMIT 10
         ''', (chat_id,)).fetchall()
         
-        text = get_text('leaderboard', lang)
+        if not players:
+            await message.reply("📊 Таблица лидеров пуста")
+            return
+        
+        player_list = ""
         for i, p in enumerate(players, 1):
-            text += f"{i}. {p['nick']} — {p['score']} очков\n"
+            player_list += f"{i}. {p['nick']} — {p['score']} очков\n"
+        
+        text = get_text('leaderboard', lang, list=player_list)
     
     await message.reply(text)
 
