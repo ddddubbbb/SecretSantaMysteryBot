@@ -870,51 +870,110 @@ async def check_bot_conflicts():
         logger.error(f"Ошибка проверки конфликтов: {e}")
         return False
 
-async def safe_polling():
-    """Безопасный polling с обработкой конфликтов"""
-    max_retries = 5
-    retry_count = 0
+async def aggressive_conflict_cleanup():
+    """Агрессивная очистка всех возможных конфликтов перед стартом"""
+    logger.info(f"🧹 Начинаем агрессивную очистку конфликтов для Instance: {INSTANCE_ID}")
     
-    while retry_count < max_retries:
+    cleanup_attempts = 3
+    for attempt in range(cleanup_attempts):
         try:
-            logger.info(f"Запуск polling (попытка {retry_count + 1}/{max_retries})")
-            await dp.start_polling(bot, handle_signals=False)
-            break  # Если дошли сюда, polling работает успешно
+            logger.info(f"🧹 Попытка очистки {attempt + 1}/{cleanup_attempts}")
+            
+            # 1. Удаляем webhook если есть
+            webhook_info = await bot.get_webhook_info()
+            if webhook_info.url:
+                logger.warning(f"🔗 Обнаружен webhook: {webhook_info.url}")
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("✅ Webhook удален с drop_pending_updates=True")
+            
+            # 2. Дополнительная очистка pending updates
+            try:
+                # Попытка получить и сбросить обновления
+                await bot.get_updates(offset=-1, limit=1, timeout=1)
+                logger.info("✅ Pending updates очищены")
+            except Exception as e:
+                logger.debug(f"Не критично: ошибка очистки updates: {e}")
+            
+            # 3. Небольшая пауза между попытками
+            if attempt < cleanup_attempts - 1:
+                await asyncio.sleep(2)
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка очистки (попытка {attempt + 1}): {e}")
+            if attempt < cleanup_attempts - 1:
+                await asyncio.sleep(3)
+    
+    logger.info("🧹 Агрессивная очистка завершена")
+
+async def robust_polling():
+    """Устойчивый polling с принудительной очисткой конфликтов"""
+    max_restarts = 3
+    restart_count = 0
+    
+    while restart_count < max_restarts:
+        try:
+            logger.info(f"🚀 Запуск robust polling (рестарт {restart_count + 1}/{max_restarts})")
+            
+            # Агрессивная очистка перед каждым стартом
+            await aggressive_conflict_cleanup()
+            
+            # Дополнительная пауза для стабилизации
+            await asyncio.sleep(5)
+            
+            logger.info("🔄 Стартуем dp.start_polling...")
+            
+            # Запускаем стандартный polling aiogram (он сам обрабатывает retry)
+            await dp.start_polling(
+                bot, 
+                handle_signals=False,
+                # Дополнительные параметры для стабильности
+                allowed_updates=dp.resolve_used_update_types()
+            )
+            
+            # Если дошли сюда без исключений - polling работает
+            logger.info("✅ Polling запущен успешно")
+            break
             
         except Exception as e:
             error_msg = str(e)
+            restart_count += 1
             
-            if "Conflict: terminated by other getUpdates request" in error_msg:
-                retry_count += 1
-                wait_time = min(30 * retry_count, 300)  # Максимум 5 минут
+            logger.error(f"❌ Ошибка запуска polling: {e}")
+            
+            if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
+                logger.error(f"🔄 Обнаружен конфликт. Рестарт {restart_count}/{max_restarts}")
                 
-                logger.error(f"Конфликт getUpdates обнаружен. Попытка {retry_count}/{max_retries}")
-                logger.error(f"Возможные причины:")
-                logger.error(f"  - Другой экземпляр бота запущен с тем же токеном")
-                logger.error(f"  - Локальная разработка + продакшен используют один токен")
-                logger.error(f"  - Restart loop на хостинге")
-                logger.error(f"Ожидание {wait_time} секунд перед повтором...")
-                
-                await asyncio.sleep(wait_time)
-                
-                # Пытаемся очистить конфликтующие подключения
-                try:
-                    await bot.delete_webhook(drop_pending_updates=True)
-                    await asyncio.sleep(5)  # Даем время на очистку
-                except:
-                    pass
-                    
+                if restart_count < max_restarts:
+                    wait_time = 10 * restart_count  # Увеличиваем паузу
+                    logger.info(f"⏳ Ждем {wait_time} секунд перед перезапуском...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("🚨 Превышено максимальное количество перезапусков")
+                    raise
             else:
-                logger.error(f"Неожиданная ошибка polling: {e}")
+                logger.error(f"🚨 Неожиданная ошибка: {e}")
                 raise
     
-    if retry_count >= max_retries:
-        logger.error("Превышено максимальное количество попыток запуска polling")
-        logger.error("Возможные решения:")
-        logger.error("1. Убедитесь, что только один экземпляр бота запущен")
-        logger.error("2. Проверьте, не используется ли токен в другом месте")
-        logger.error("3. Обратитесь к администратору хостинга")
-        raise RuntimeError("Не удалось запустить бота из-за конфликтов")
+    if restart_count >= max_restarts:
+        error_msg = f"""
+🚨 КРИТИЧЕСКАЯ ОШИБКА: Не удалось запустить бота после {max_restarts} попыток!
+
+🔍 Возможные причины:
+1. Другой экземпляр бота уже запущен с тем же токеном
+2. Локальная разработка конфликтует с продакшеном  
+3. Хостинг создает несколько экземпляров одновременно
+4. Webhook установлен в другом месте
+
+💡 Решения:
+1. Остановите все другие экземпляры бота
+2. Используйте разные токены для разработки и продакшена
+3. Проверьте настройки автодеплоя на хостинге
+4. Установите webhook на пустой URL: /setWebhook?url=
+
+Instance ID: {INSTANCE_ID}
+"""
+        logger.error(error_msg)
+        raise RuntimeError("Критический сбой запуска из-за конфликтов")
 
 # === ЗАПУСК ===
 async def main():
@@ -931,8 +990,8 @@ async def main():
         logger.info(f"✅ Secret Santa Bot запущен (Instance: {INSTANCE_ID})")
         print(f"✅ Secret Santa Bot запущен (Instance: {INSTANCE_ID})")
         
-        # Безопасный запуск polling
-        await safe_polling()
+        # Устойчивый запуск polling с агрессивной очисткой конфликтов
+        await robust_polling()
         
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
