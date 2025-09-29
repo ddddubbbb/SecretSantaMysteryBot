@@ -80,7 +80,10 @@ TEXTS = {
         'theme_selected': "🎨 Тема установлена: {theme}",
         'premium_intro': "✨ Разблокируйте премиум-ник за 50 звёзд Telegram!\nВыберите один:",
         'nick_unlocked': "🎉 Ник активирован: {nick}\n\n✨ Спасибо за поддержку! Ты сделал праздник ярче!",
-        'premium_sold': "🚫 Этот ник уже куплен другим участником."
+        'premium_sold': "🚫 Этот ник уже куплен другим участником.",
+        'auto_register_call': "🎄 Игра в Тайного Санту настроена!\n\n👥 Участников: {count}\n\n🎮 Хотите участвовать? Нажмите кнопку ниже!",
+        'joined_game': "✅ Вы присоединились к игре с ником {nick}!",
+        'already_joined': "ℹ️ Вы уже участвуете в игре."
     },
     'en': {
         'start': "🎁 Hi! I'm a *Secret Santa* bot.\n\n"
@@ -124,7 +127,10 @@ TEXTS = {
         'theme_selected': "🎨 Theme set: {theme}",
         'premium_intro': "✨ Unlock a premium nick for 50 Telegram Stars!\nChoose one:",
         'nick_unlocked': "🎉 Nick unlocked: {nick}\n\n✨ Thank you for support! You made the party brighter!",
-        'premium_sold': "🚫 This nick is already purchased by another player."
+        'premium_sold': "🚫 This nick is already purchased by another player.",
+        'auto_register_call': "🎄 Secret Santa game is set up!\n\n👥 Participants: {count}\n\n🎮 Want to participate? Click the button below!",
+        'joined_game': "✅ You joined the game with nick {nick}!",
+        'already_joined': "ℹ️ You are already participating in the game."
     }
 }
 
@@ -258,35 +264,54 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
         logger.error(f"Ошибка проверки прав администратора: {e}")
         return False
 
-async def register_all_members(chat_id: str, theme: str = 'christmas'):
-    """Регистрирует всех участников группы в игре"""
+async def register_user(user_id: str, chat_id: str, full_name: str, theme: str = 'christmas'):
+    """Регистрирует отдельного пользователя в игре"""
     try:
-        # Получаем список всех участников чата
-        chat_members = []
-        async for member in bot.iter_chat_members(int(chat_id)):
-            if not member.user.is_bot and member.status != 'left':
-                chat_members.append(member.user)
-        
-        logger.info(f"Найдено {len(chat_members)} участников в чате {chat_id}")
-        
         with get_db() as db:
-            for user in chat_members:
-                user_id = str(user.id)
-                full_name = f"{user.first_name} {user.last_name}" if user.last_name else user.first_name
+            # Проверяем, уже ли зарегистрирован
+            existing = db.execute('SELECT 1 FROM players WHERE user_id = ? AND chat_id = ?', (user_id, chat_id)).fetchone()
+            if existing:
+                return False  # Уже зарегистрирован
+            
+            nick = generate_nick(theme)
+            # Проверяем, что ник уникальный
+            while db.execute('SELECT 1 FROM players WHERE nick = ? AND chat_id = ?', (nick, chat_id)).fetchone():
                 nick = generate_nick(theme)
-                
-                # Проверяем, что ник уникальный
-                while db.execute('SELECT 1 FROM players WHERE nick = ? AND chat_id = ?', (nick, chat_id)).fetchone():
-                    nick = generate_nick(theme)
-                
-                db.execute('''
-                    INSERT OR REPLACE INTO players (user_id, chat_id, full_name, nick)
-                    VALUES (?, ?, ?, ?)
-                ''', (user_id, chat_id, full_name, nick))
-        
-        return len(chat_members)
+            
+            db.execute('''
+                INSERT INTO players (user_id, chat_id, full_name, nick)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, chat_id, full_name, nick))
+            
+            logger.info(f"Пользователь {full_name} ({user_id}) зарегистрирован в игре {chat_id} с ником {nick}")
+            return True
     except Exception as e:
-        logger.error(f"Ошибка регистрации участников: {e}")
+        logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
+        return False
+
+async def auto_register_from_activity(chat_id: str, theme: str = 'christmas'):
+    """
+    Попытка автоматической регистрации через активность.
+    Отправляет сообщение с призывом к участию.
+    """
+    try:
+        with get_db() as db:
+            # Подсчитываем текущих зарегистрированных участников
+            count = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()['cnt']
+        
+        lang = get_lang(chat_id)
+        message = get_text('auto_register_call', lang).format(count=count)
+        
+        # Отправляем сообщение с кнопкой для регистрации
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎄 Участвовать в игре", callback_data="join_game")]
+        ])
+        
+        await bot.send_message(chat_id, message, reply_markup=kb)
+        logger.info(f"Отправлен призыв к участию в чат {chat_id}")
+        return count
+    except Exception as e:
+        logger.error(f"Ошибка автоматической регистрации через активность: {e}")
         return 0
 
 # === УСТАНОВКА КОМАНД В МЕНЮ ===
@@ -356,14 +381,10 @@ async def set_theme(callback, state: FSMContext):
     with get_db() as db:
         db.execute('INSERT OR REPLACE INTO games (chat_id, theme) VALUES (?, ?)', (chat_id, theme))
     
-    # Автоматически регистрируем всех участников группы
-    registered_count = await register_all_members(chat_id, theme)
+    # Призываем участников к регистрации через активность
+    registered_count = await auto_register_from_activity(chat_id, theme)
     
-    await callback.message.answer(
-        f"✅ Тема установлена: {theme}\n"
-        f"👥 Зарегистрировано участников: {registered_count}\n\n"
-        f"{get_text('setup_prompt_draw', lang)}"
-    )
+    await callback.message.answer(get_text('setup_prompt_draw', lang))
     await state.set_state(SetupState.waiting_draw)
 
 @dp.message(SetupState.waiting_draw)
@@ -487,22 +508,64 @@ async def on_join(message: Message):
                     continue  # Нет активной игры
                 
                 theme = game['theme']
-                nick = generate_nick(theme)
-                
-                # Убеждаемся, что ник уникален
-                while db.execute('SELECT 1 FROM players WHERE nick = ? AND chat_id = ?', (nick, chat_id)).fetchone():
-                    nick = generate_nick(theme)
-                
-                db.execute('''
-                    INSERT OR IGNORE INTO players (user_id, chat_id, full_name, nick)
-                    VALUES (?, ?, ?, ?)
-                ''', (user_id, chat_id, full_name, nick))
             
-            lang = get_lang(chat_id)
-            await message.answer(f"👋 {full_name} присоединился к игре с ником {nick}!")
-            logger.info(f"Новый участник {full_name} добавлен в игру {chat_id}")
+            # Автоматически регистрируем нового участника
+            success = await register_user(user_id, chat_id, full_name, theme)
+            
+            if success:
+                with get_db() as db:
+                    player = db.execute('SELECT nick FROM players WHERE user_id = ? AND chat_id = ?', (user_id, chat_id)).fetchone()
+                    nick = player['nick'] if player else "Unknown"
+                
+                lang = get_lang(chat_id)
+                await message.answer(f"👋 {full_name} присоединился к игре с ником {nick}!")
+                logger.info(f"Новый участник {full_name} добавлен в игру {chat_id}")
     except Exception as e:
         logger.error(f"Ошибка обработки новых участников: {e}")
+
+# Добавляем обработчик обычных сообщений для автоматической регистрации активных участников
+@dp.message(F.text)
+async def auto_register_on_activity(message: Message):
+    """Автоматически регистрирует участников при их активности в группе"""
+    try:
+        # Проверяем только группы
+        if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            return
+        
+        # Игнорируем команды - они обрабатываются отдельно
+        if message.text and message.text.startswith('/'):
+            return
+        
+        chat_id = str(message.chat.id)
+        user_id = str(message.from_user.id)
+        full_name = f"{message.from_user.first_name} {message.from_user.last_name}" if message.from_user.last_name else message.from_user.first_name
+        
+        # Проверяем, есть ли активная игра
+        with get_db() as db:
+            game = db.execute('SELECT theme FROM games WHERE chat_id = ?', (chat_id,)).fetchone()
+            if not game:
+                return  # Нет активной игры
+            
+            # Проверяем, уже ли зарегистрирован
+            existing = db.execute('SELECT 1 FROM players WHERE user_id = ? AND chat_id = ?', (user_id, chat_id)).fetchone()
+            if existing:
+                return  # Уже зарегистрирован
+            
+            theme = game['theme']
+        
+        # Регистрируем пользователя при первой активности
+        success = await register_user(user_id, chat_id, full_name, theme)
+        
+        if success:
+            with get_db() as db:
+                player = db.execute('SELECT nick FROM players WHERE user_id = ? AND chat_id = ?', (user_id, chat_id)).fetchone()
+                nick = player['nick'] if player else "Unknown"
+            
+            lang = get_lang(chat_id)
+            logger.info(f"Автоматически зарегистрирован активный участник {full_name} ({user_id}) с ником {nick} в чате {chat_id}")
+    
+    except Exception as e:
+        logger.error(f"Ошибка автоматической регистрации при активности: {e}")
 
 @dp.message(Command("mygift"))
 async def mygift(message: Message, state: FSMContext):
@@ -551,6 +614,52 @@ async def santabingo(message: Message):
             kb.append([InlineKeyboardButton(text=p['nick'], callback_data=f"guess_{target['user_id']}_{p['user_id']}")])
         
         await message.reply(get_text('santabingo_intro', lang, nick=target['nick']), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "join_game")
+async def join_game(callback):
+    """Обрабатывает запрос на участие в игре"""
+    try:
+        chat_id = str(callback.message.chat.id)
+        user_id = str(callback.from_user.id)
+        full_name = f"{callback.from_user.first_name} {callback.from_user.last_name}" if callback.from_user.last_name else callback.from_user.first_name
+        lang = get_lang(chat_id)
+        
+        # Получаем тему игры
+        with get_db() as db:
+            game = db.execute('SELECT theme FROM games WHERE chat_id = ?', (chat_id,)).fetchone()
+            if not game:
+                await callback.answer("❌ Игра не настроена.", show_alert=True)
+                return
+            
+            theme = game['theme']
+        
+        # Регистрируем пользователя
+        success = await register_user(user_id, chat_id, full_name, theme)
+        
+        if success:
+            # Получаем ник пользователя
+            with get_db() as db:
+                player = db.execute('SELECT nick FROM players WHERE user_id = ? AND chat_id = ?', (user_id, chat_id)).fetchone()
+                nick = player['nick'] if player else "Unknown"
+            
+            await callback.answer(get_text('joined_game', lang).format(nick=nick), show_alert=True)
+        else:
+            await callback.answer(get_text('already_joined', lang), show_alert=True)
+        
+        # Обновляем количество участников в сообщении
+        with get_db() as db:
+            count = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()['cnt']
+        
+        new_message = get_text('auto_register_call', lang).format(count=count)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎄 Участвовать в игре", callback_data="join_game")]
+        ])
+        
+        await callback.message.edit_text(new_message, reply_markup=kb)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при присоединении к игре: {e}")
+        await callback.answer("❌ Произошла ошибка при регистрации.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("guess_"))
 async def process_guess(callback):
