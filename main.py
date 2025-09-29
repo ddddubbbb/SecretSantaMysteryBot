@@ -304,7 +304,8 @@ async def auto_register_from_activity(chat_id: str, theme: str = 'christmas'):
     try:
         with get_db() as db:
             # Подсчитываем текущих зарегистрированных участников
-            count = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()['cnt']
+            result = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()
+            count = result['cnt'] if result else 0
         
         lang = get_lang(chat_id)
         message = get_text('auto_register_call', lang).format(count=count)
@@ -319,6 +320,7 @@ async def auto_register_from_activity(chat_id: str, theme: str = 'christmas'):
         return count
     except Exception as e:
         logger.error(f"Ошибка автоматической регистрации через активность: {e}")
+        logger.error(f"Детали ошибки: {traceback.format_exc()}")
         return 0
 
 # === УСТАНОВКА КОМАНД В МЕНЮ ===
@@ -655,7 +657,8 @@ async def join_game(callback):
         
         # Обновляем количество участников в сообщении
         with get_db() as db:
-            count = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()['cnt']
+            result = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()
+            count = result['cnt'] if result else 0
         
         new_message = get_text('auto_register_call', lang).format(count=count)
         kb = InlineKeyboardMarkup(inline_keyboard=[
