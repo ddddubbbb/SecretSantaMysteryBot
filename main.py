@@ -25,6 +25,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен")
 
+# Уникальный идентификатор экземпляра для предотвращения конфликтов
+INSTANCE_ID = f"santa_bot_{hashlib.md5(f'{BOT_TOKEN}{os.getpid()}{datetime.now().timestamp()}'.encode()).hexdigest()[:8]}"
+
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
@@ -834,20 +837,101 @@ async def error_handler(update, exception):
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
 
+# === СИСТЕМА ПРЕДОТВРАЩЕНИЯ КОНФЛИКТОВ ===
+async def check_bot_conflicts():
+    """Проверяет и решает конфликты с другими экземплярами бота"""
+    try:
+        # Попытка получить информацию о боте
+        bot_info = await bot.get_me()
+        logger.info(f"Bot info: {bot_info.first_name} (@{bot_info.username}) - Instance: {INSTANCE_ID}")
+        
+        # Очищаем webhook если установлен (может конфликтовать с polling)
+        webhook_info = await bot.get_webhook_info()
+        if webhook_info.url:
+            logger.warning(f"Webhook обнаружен: {webhook_info.url}. Удаляем для polling...")
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook удален, polling может работать.")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка проверки конфликтов: {e}")
+        return False
+
+async def safe_polling():
+    """Безопасный polling с обработкой конфликтов"""
+    max_retries = 5
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            logger.info(f"Запуск polling (попытка {retry_count + 1}/{max_retries})")
+            await dp.start_polling(bot, handle_signals=False)
+            break  # Если дошли сюда, polling работает успешно
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            if "Conflict: terminated by other getUpdates request" in error_msg:
+                retry_count += 1
+                wait_time = min(30 * retry_count, 300)  # Максимум 5 минут
+                
+                logger.error(f"Конфликт getUpdates обнаружен. Попытка {retry_count}/{max_retries}")
+                logger.error(f"Возможные причины:")
+                logger.error(f"  - Другой экземпляр бота запущен с тем же токеном")
+                logger.error(f"  - Локальная разработка + продакшен используют один токен")
+                logger.error(f"  - Restart loop на хостинге")
+                logger.error(f"Ожидание {wait_time} секунд перед повтором...")
+                
+                await asyncio.sleep(wait_time)
+                
+                # Пытаемся очистить конфликтующие подключения
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True)
+                    await asyncio.sleep(5)  # Даем время на очистку
+                except:
+                    pass
+                    
+            else:
+                logger.error(f"Неожиданная ошибка polling: {e}")
+                raise
+    
+    if retry_count >= max_retries:
+        logger.error("Превышено максимальное количество попыток запуска polling")
+        logger.error("Возможные решения:")
+        logger.error("1. Убедитесь, что только один экземпляр бота запущен")
+        logger.error("2. Проверьте, не используется ли токен в другом месте")
+        logger.error("3. Обратитесь к администратору хостинга")
+        raise RuntimeError("Не удалось запустить бота из-за конфликтов")
+
 # === ЗАПУСК ===
 async def main():
     try:
+        # Инициализация
         init_db()
         await set_bot_commands()
         scheduler.start()
-        logger.info("✅ Secret Santa Bot запущен и готов к работе!")
-        print("✅ Secret Santa Bot запущен и готов к работе!")
-        await dp.start_polling(bot)
+        
+        # Проверка конфликтов
+        if not await check_bot_conflicts():
+            raise RuntimeError("Ошибка проверки конфликтов бота")
+        
+        logger.info(f"✅ Secret Santa Bot запущен (Instance: {INSTANCE_ID})")
+        print(f"✅ Secret Santa Bot запущен (Instance: {INSTANCE_ID})")
+        
+        # Безопасный запуск polling
+        await safe_polling()
+        
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка запуска: {e}")
         raise
     finally:
-        scheduler.shutdown()
+        try:
+            scheduler.shutdown()
+            await bot.session.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     try:
