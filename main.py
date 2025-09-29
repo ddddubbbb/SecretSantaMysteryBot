@@ -1,22 +1,40 @@
 # main.py
 import asyncio
+import logging
+import traceback
+from typing import Optional, List, Dict, Any
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, PreCheckoutQuery, LabeledPrice
+from aiogram.types import (
+    Message, InlineKeyboardButton, InlineKeyboardMarkup, 
+    PreCheckoutQuery, LabeledPrice, ChatMemberOwner, ChatMemberAdministrator
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import sqlite3
 import os
 from contextlib import contextmanager
 from datetime import datetime
 import random
+import hashlib
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен")
+
+# === ЛОГИРОВАНИЕ ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # === ПЕРЕВОДЫ ===
 TEXTS = {
@@ -192,10 +210,24 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 # === ФУНКЦИИ ===
+def sanitize_input(text: str, max_length: int = 1000) -> str:
+    """Очищает пользовательский ввод от потенциально опасных символов"""
+    if not text:
+        return ""
+    
+    # Убираем потенциально опасные символы
+    import re
+    sanitized = re.sub(r'[<>"\';]', '', str(text)[:max_length])
+    return sanitized.strip()
+
 def get_lang(chat_id):
-    with get_db() as db:
-        row = db.execute('SELECT lang FROM games WHERE chat_id = ?', (str(chat_id),)).fetchone()
-        return row['lang'] if row else 'ru'
+    try:
+        with get_db() as db:
+            row = db.execute('SELECT lang FROM games WHERE chat_id = ?', (str(chat_id),)).fetchone()
+            return row['lang'] if row else 'ru'
+    except Exception as e:
+        logger.error(f"Ошибка получения языка: {e}")
+        return 'ru'
 
 def get_theme(chat_id):
     with get_db() as db:
@@ -206,9 +238,56 @@ def get_text(key, lang, **kwargs):
     return TEXTS[lang][key].format(**kwargs)
 
 def generate_nick(theme):
-    prefixes = ["Санта", "Эльф", "Мороз", "Подарок", "Новогодик", "Снежок", "Frost", "Gift", "Jingle"]
-    suffixes = [str(i).zfill(2) for i in range(1, 21)]
+    """Генерирует случайный ник на основе темы"""
+    base_nicks = {
+        'christmas': ["Санта", "Эльф", "Мороз", "Подарок", "Новогодик", "Снежок", "Олень", "Елочка"],
+        'halloween': ["Призрак", "Ведьма", "Тыква", "Летучая Мышь", "Паук", "Скелет", "Вампир", "Оборотень"],
+        'office': ["Кофе", "Принтер", "Папка", "Степлер", "Монитор", "Стол", "Стул", "Лампа"]
+    }
+    
+    prefixes = base_nicks.get(theme, base_nicks['christmas'])
+    suffixes = [str(i).zfill(2) for i in range(1, 99)]
     return random.choice(prefixes) + random.choice(suffixes)
+
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором чата"""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return isinstance(member, (ChatMemberOwner, ChatMemberAdministrator))
+    except Exception as e:
+        logger.error(f"Ошибка проверки прав администратора: {e}")
+        return False
+
+async def register_all_members(chat_id: str, theme: str = 'christmas'):
+    """Регистрирует всех участников группы в игре"""
+    try:
+        # Получаем список всех участников чата
+        chat_members = []
+        async for member in bot.iter_chat_members(int(chat_id)):
+            if not member.user.is_bot and member.status != 'left':
+                chat_members.append(member.user)
+        
+        logger.info(f"Найдено {len(chat_members)} участников в чате {chat_id}")
+        
+        with get_db() as db:
+            for user in chat_members:
+                user_id = str(user.id)
+                full_name = f"{user.first_name} {user.last_name}" if user.last_name else user.first_name
+                nick = generate_nick(theme)
+                
+                # Проверяем, что ник уникальный
+                while db.execute('SELECT 1 FROM players WHERE nick = ? AND chat_id = ?', (nick, chat_id)).fetchone():
+                    nick = generate_nick(theme)
+                
+                db.execute('''
+                    INSERT OR REPLACE INTO players (user_id, chat_id, full_name, nick)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, chat_id, full_name, nick))
+        
+        return len(chat_members)
+    except Exception as e:
+        logger.error(f"Ошибка регистрации участников: {e}")
+        return 0
 
 # === УСТАНОВКА КОМАНД В МЕНЮ ===
 async def set_bot_commands():
@@ -249,6 +328,16 @@ async def help(callback):
 
 @dp.message(Command("setup"))
 async def setup(message: Message, state: FSMContext):
+    # Проверяем, что команда вызвана в группе
+    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        await message.reply("❌ Эта команда работает только в группах.")
+        return
+    
+    # Проверяем админские права
+    if not await is_admin(message.chat.id, message.from_user.id):
+        await message.reply("❌ Только администраторы могут настраивать игру.")
+        return
+    
     lang = get_lang(message.chat.id)
     kb = [
         [InlineKeyboardButton(text="🎄 Рождество", callback_data="theme_christmas")],
@@ -267,7 +356,14 @@ async def set_theme(callback, state: FSMContext):
     with get_db() as db:
         db.execute('INSERT OR REPLACE INTO games (chat_id, theme) VALUES (?, ?)', (chat_id, theme))
     
-    await callback.message.answer(get_text('setup_prompt_draw', lang))
+    # Автоматически регистрируем всех участников группы
+    registered_count = await register_all_members(chat_id, theme)
+    
+    await callback.message.answer(
+        f"✅ Тема установлена: {theme}\n"
+        f"👥 Зарегистрировано участников: {registered_count}\n\n"
+        f"{get_text('setup_prompt_draw', lang)}"
+    )
     await state.set_state(SetupState.waiting_draw)
 
 @dp.message(SetupState.waiting_draw)
@@ -306,28 +402,47 @@ async def set_reveal(message: Message, state: FSMContext):
         await message.reply(get_text('invalid_date', lang))
 
 async def do_draw(chat_id):
-    with get_db() as db:
-        players = db.execute('SELECT user_id FROM players WHERE chat_id = ?', (chat_id,)).fetchall()
-        if len(players) < 3: return
-        user_ids = [p['user_id'] for p in players]
-        random.shuffle(user_ids)
-        for i in range(len(user_ids)):
-            giver = user_ids[i]
-            receiver = user_ids[(i + 1) % len(user_ids)]
-            db.execute('UPDATE players SET target_id = ? WHERE user_id = ? AND chat_id = ?', (receiver, giver, chat_id))
-        
-        for i in range(len(user_ids)):
-            try:
-                target = db.execute('''
-                    SELECT p.nick, p.gift FROM players p
-                    WHERE p.user_id = ? AND p.chat_id = ?
-                ''', (user_ids[(i + 1) % len(user_ids)], chat_id)).fetchone()
-                msg = f"🎁 Вы дарите: {target['nick']}\n"
-                if target['gift']:
-                    msg += f"📝 Желание: {target['gift']}"
-                await bot.send_message(user_ids[i], msg)
-            except: pass
-        await bot.send_message(chat_id, get_text('draw_done', get_lang(chat_id)))
+    """Проводит жеребьевку и назначает участников"""
+    try:
+        with get_db() as db:
+            players = db.execute('SELECT user_id FROM players WHERE chat_id = ?', (chat_id,)).fetchall()
+            if len(players) < 2:  # Минимум 2 участника
+                await bot.send_message(chat_id, "❌ Недостаточно участников для жеребьевки (минимум 2)")
+                return
+            
+            user_ids = [p['user_id'] for p in players]
+            random.shuffle(user_ids)
+            
+            # Назначаем получателей подарков
+            for i in range(len(user_ids)):
+                giver = user_ids[i]
+                receiver = user_ids[(i + 1) % len(user_ids)]
+                db.execute('UPDATE players SET target_id = ? WHERE user_id = ? AND chat_id = ?', (receiver, giver, chat_id))
+            
+            # Отправляем уведомления участникам
+            for i in range(len(user_ids)):
+                try:
+                    target = db.execute('''
+                        SELECT p.nick, p.gift FROM players p
+                        WHERE p.user_id = ? AND p.chat_id = ?
+                    ''', (user_ids[(i + 1) % len(user_ids)], chat_id)).fetchone()
+                    
+                    msg = f"🎁 Ваш получатель подарка: {target['nick']}\n"
+                    if target['gift']:
+                        msg += f"📝 Их желание: {target['gift']}"
+                    else:
+                        msg += "📝 Желание пока не указано"
+                    
+                    await bot.send_message(user_ids[i], msg)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки сообщения пользователю {user_ids[i]}: {e}")
+            
+            lang = get_lang(chat_id)
+            await bot.send_message(chat_id, get_text('draw_done', lang))
+            logger.info(f"Жеребьевка завершена для чата {chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка проведения жеребьевки: {e}")
+        await bot.send_message(chat_id, "❌ Произошла ошибка во время жеребьевки")
 
 async def finish_game(chat_id):
     lang = get_lang(chat_id)
@@ -355,24 +470,39 @@ async def finish_game(chat_id):
 
 @dp.message(F.new_chat_members)
 async def on_join(message: Message):
-    for user in message.new_chat_members:
-        if user.is_bot: continue
-        chat_id = str(message.chat.id)
-        user_id = str(user.id)
-        full_name = f"{user.first_name} {user.last_name}" if user.last_name else user.first_name
-        
-        theme = get_theme(chat_id)
-        nick = generate_nick(theme)
-        
-        with get_db() as db:
-            db.execute('''
-                INSERT OR IGNORE INTO players (user_id, chat_id, full_name, nick)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, chat_id, full_name, nick))
-        
-        lang = get_lang(chat_id)
-        if db.execute('SELECT 1 FROM games WHERE chat_id = ?', (chat_id,)).fetchone():
-            await message.answer(get_text('game_active', lang))
+    """Обрабатывает добавление новых участников в группу"""
+    try:
+        for user in message.new_chat_members:
+            if user.is_bot: 
+                continue
+            
+            chat_id = str(message.chat.id)
+            user_id = str(user.id)
+            full_name = f"{user.first_name} {user.last_name}" if user.last_name else user.first_name
+            
+            # Проверяем, есть ли активная игра
+            with get_db() as db:
+                game = db.execute('SELECT theme FROM games WHERE chat_id = ?', (chat_id,)).fetchone()
+                if not game:
+                    continue  # Нет активной игры
+                
+                theme = game['theme']
+                nick = generate_nick(theme)
+                
+                # Убеждаемся, что ник уникален
+                while db.execute('SELECT 1 FROM players WHERE nick = ? AND chat_id = ?', (nick, chat_id)).fetchone():
+                    nick = generate_nick(theme)
+                
+                db.execute('''
+                    INSERT OR IGNORE INTO players (user_id, chat_id, full_name, nick)
+                    VALUES (?, ?, ?, ?)
+                ''', (user_id, chat_id, full_name, nick))
+            
+            lang = get_lang(chat_id)
+            await message.answer(f"👋 {full_name} присоединился к игре с ником {nick}!")
+            logger.info(f"Новый участник {full_name} добавлен в игру {chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка обработки новых участников: {e}")
 
 @dp.message(Command("mygift"))
 async def mygift(message: Message, state: FSMContext):
@@ -382,15 +512,27 @@ async def mygift(message: Message, state: FSMContext):
 
 @dp.message(GiftState.waiting)
 async def set_gift(message: Message, state: FSMContext):
-    user_id = str(message.from_user.id)
-    chat_id = str(message.chat.id)
-    lang = get_lang(chat_id)
-    
-    with get_db() as db:
-        db.execute('UPDATE players SET gift = ? WHERE user_id = ? AND chat_id = ?', (message.text, user_id, chat_id))
-    
-    await message.reply(get_text('gift_saved', lang))
-    await state.clear()
+    """Сохраняет желание пользователя с валидацией"""
+    try:
+        user_id = str(message.from_user.id)
+        chat_id = str(message.chat.id)
+        lang = get_lang(chat_id)
+        
+        # Валидация ввода
+        gift_text = sanitize_input(message.text, max_length=500)
+        if not gift_text or len(gift_text.strip()) < 3:
+            await message.reply("❌ Желание должно содержать минимум 3 символа.")
+            return
+        
+        with get_db() as db:
+            db.execute('UPDATE players SET gift = ? WHERE user_id = ? AND chat_id = ?', (gift_text, user_id, chat_id))
+        
+        await message.reply(get_text('gift_saved', lang))
+        await state.clear()
+        logger.info(f"Пользователь {user_id} установил желание в чате {chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения желания: {e}")
+        await message.reply("❌ Произошла ошибка при сохранении желания.")
 
 @dp.message(Command("santabingo"))
 async def santabingo(message: Message):
@@ -515,6 +657,35 @@ async def success_pay(message: Message):
     lang = get_lang(chat_id)
     await message.answer(get_text('nick_unlocked', lang, nick=nick))
 
+@dp.message(Command("info"))
+async def game_info(message: Message):
+    """Показывает информацию о текущей игре"""
+    chat_id = str(message.chat.id)
+    
+    with get_db() as db:
+        game = db.execute('SELECT * FROM games WHERE chat_id = ?', (chat_id,)).fetchone()
+        if not game:
+            await message.reply("❌ Игра не настроена. Используйте /setup для начала.")
+            return
+        
+        players_count = db.execute('SELECT COUNT(*) as cnt FROM players WHERE chat_id = ?', (chat_id,)).fetchone()['cnt']
+        
+        info_text = f"🎮 **Информация об игре**\n\n"
+        info_text += f"🎨 Тема: {game['theme']}\n"
+        info_text += f"👥 Участников: {players_count}\n"
+        
+        if game['draw_time']:
+            draw_dt = datetime.fromtimestamp(game['draw_time'])
+            info_text += f"🎲 Жеребьевка: {draw_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        if game['end_time']:
+            end_dt = datetime.fromtimestamp(game['end_time'])
+            info_text += f"🎊 Раскрытие: {end_dt.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        info_text += f"🌍 Язык: {game['lang']}"
+    
+    await message.reply(info_text, parse_mode=ParseMode.MARKDOWN)
+
 @dp.message(Command("lang"))
 async def change_lang(message: Message):
     chat_id = str(message.chat.id)
@@ -538,13 +709,42 @@ async def donate(message: Message):
         need_name=False
     )
 
+# === ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ===
+@dp.error()
+async def error_handler(update, exception):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"Ошибка обработки обновления {update}: {exception}")
+    logger.error(traceback.format_exc())
+    
+    # Попытка отправить уведомление пользователю
+    try:
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply("❌ Произошла ошибка. Попробуйте позже.")
+        elif hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.message.reply("❌ Произошла ошибка. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
+
 # === ЗАПУСК ===
 async def main():
-    init_db()
-    await set_bot_commands()
-    scheduler.start()
-    print("✅ Secret Santa Bot запущен и готов к работе!")
-    await dp.start_polling(bot)
+    try:
+        init_db()
+        await set_bot_commands()
+        scheduler.start()
+        logger.info("✅ Secret Santa Bot запущен и готов к работе!")
+        print("✅ Secret Santa Bot запущен и готов к работе!")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка запуска: {e}")
+        raise
+    finally:
+        scheduler.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        raise

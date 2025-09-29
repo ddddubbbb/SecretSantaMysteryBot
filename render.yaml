@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: secret-santa-bot
     runtime: python
     plan: free
@@ -7,4 +7,4 @@ services:
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        generateValue: true
+        sync: false
